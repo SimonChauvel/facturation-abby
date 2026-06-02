@@ -1,7 +1,6 @@
 """
 Webhook systeme.io → Abby
 Regroupe offre principale + order bump + upsell en une seule facture Abby (brouillon).
-Route BtoB France uniquement pour l'instant.
 """
 
 import os
@@ -14,7 +13,7 @@ import requests
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 ABBY_API_KEY  = os.environ.get("ABBY_API_KEY", "")
-ABBY_BASE_URL = "https://api.app-abby.com"   # ← bonne URL (pas api.abby.fr)
+ABBY_BASE_URL = "https://api.app-abby.com"
 DELAY_SECONDS = int(os.environ.get("DELAY_SECONDS", 60))
 PORT          = int(os.environ.get("PORT", 8080))
 
@@ -26,7 +25,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── STOCKAGE TEMPORAIRE ─────────────────────────────────────────────────────
-# { order_id: { "items": [...], "customer": {...}, "timer": Timer } }
 pending_orders: dict = {}
 lock = threading.Lock()
 
@@ -83,11 +81,14 @@ def abby_patch(path: str, body: dict) -> dict | None:
 # ─── LOGIQUE ABBY ─────────────────────────────────────────────────────────────
 
 def find_contact_by_email(email: str) -> dict | None:
-    """Cherche un contact existant par e-mail."""
-    result = abby_get("/v2/contacts", params={"search": email, "limit": 50})
+    """Cherche un contact existant par e-mail.
+    Route correcte : GET /contacts (pluriel, sans /v2/)
+    Requiert page obligatoire.
+    """
+    result = abby_get("/contacts", params={"search": email, "page": 1, "limit": 50})
     if not result:
         return None
-    docs = result.get("docs", result.get("contacts", []))
+    docs = result.get("docs", [])
     for c in docs:
         emails = c.get("emails", [])
         if isinstance(emails, list):
@@ -99,11 +100,14 @@ def find_contact_by_email(email: str) -> dict | None:
 
 
 def find_organization_by_email(email: str) -> dict | None:
-    """Cherche une organisation existante par e-mail."""
-    result = abby_get("/v2/organizations", params={"search": email, "limit": 50})
+    """Cherche une organisation existante par e-mail.
+    Route correcte : GET /organizations (pluriel, sans /v2/)
+    Requiert page obligatoire.
+    """
+    result = abby_get("/organizations", params={"search": email, "page": 1, "limit": 50})
     if not result:
         return None
-    docs = result.get("docs", result.get("organizations", []))
+    docs = result.get("docs", [])
     for org in docs:
         emails = org.get("emails", [])
         if isinstance(emails, list):
@@ -115,7 +119,9 @@ def find_organization_by_email(email: str) -> dict | None:
 
 
 def create_organization(customer: dict) -> dict | None:
-    """Crée une nouvelle organisation dans Abby (route BtoB France)."""
+    """Crée une nouvelle organisation dans Abby.
+    Route correcte : POST /organization (singulier, sans /v2/)
+    """
     fields = customer.get("fields", {})
     company = fields.get("company_name") or f"{fields.get('first_name', '')} {fields.get('surname', '')}".strip()
     email   = customer.get("email", "")
@@ -126,7 +132,6 @@ def create_organization(customer: dict) -> dict | None:
         "vatNumber": fields.get("tax_number", "") or "",
     }
 
-    # Adresse de facturation (requise pour la facturation Abby)
     address_line = fields.get("address", "")
     city         = fields.get("city", "")
     zip_code     = fields.get("zip_code", fields.get("zipcode", ""))
@@ -141,13 +146,12 @@ def create_organization(customer: dict) -> dict | None:
         }
 
     log.info("Création organisation : %s", company)
-    return abby_post("/v2/organizations", body)
+    return abby_post("/organization", body)  # ← singulier, sans /v2/
 
 
 def get_or_create_customer_id(customer: dict) -> str | None:
     """
     Retourne l'ID client Abby (organisation ou contact) pour la facturation.
-    Cherche d'abord une organisation, puis un contact simple.
     """
     email = customer.get("email", "")
 
@@ -160,11 +164,10 @@ def get_or_create_customer_id(customer: dict) -> str | None:
     # 2. Cherche un contact simple
     contact = find_contact_by_email(email)
     if contact:
-        log.info("Contact trouvé : %s %s (id=%s)",
-                 contact.get("firstname", ""), contact.get("lastname", ""), contact.get("id"))
+        log.info("Contact trouvé : %s (id=%s)", contact.get("fullname", ""), contact.get("id"))
         return contact["id"]
 
-    # 3. Crée l'organisation
+    # 3. Crée l'organisation ou le contact
     fields = customer.get("fields", {})
     company = fields.get("company_name", "")
     if company:
@@ -173,15 +176,15 @@ def get_or_create_customer_id(customer: dict) -> str | None:
             log.info("Organisation créée : id=%s", new_org.get("id"))
             return new_org["id"]
     else:
-        # Crée un contact particulier
         first  = fields.get("first_name", "")
         last   = fields.get("surname", fields.get("last_name", ""))
         body   = {
-            "firstname": first,
+            "firstname": first or "Client",
             "lastname":  last or first or "Client",
             "emails":    [email] if email else [],
         }
-        new_contact = abby_post("/v2/contacts", body)
+        # Route correcte : POST /contact (singulier, sans /v2/)
+        new_contact = abby_post("/contact", body)
         if new_contact:
             log.info("Contact créé : id=%s", new_contact.get("id"))
             return new_contact["id"]
@@ -189,29 +192,45 @@ def get_or_create_customer_id(customer: dict) -> str | None:
     return None
 
 
-def create_invoice_draft(customer_id: str, items: list) -> dict | None:
+def create_invoice_with_lines(customer_id: str, items: list) -> dict | None:
     """
-    Crée une facture brouillon avec toutes les lignes.
-    Les montants Abby sont en CENTIMES.
-    vatCode : fr_0 pour exonération TVA (auto-entrepreneur), fr_20 sinon.
+    Crée une facture brouillon puis y ajoute toutes les lignes via PATCH.
+
+    Étape 1 : POST /v2/billing/invoice/{customerId}  → crée la facture vide
+    Étape 2 : PATCH /v2/billing/{billingId}/lines    → ajoute les lignes
+
+    Montants en centimes. vatCode FR_00HT = TVA non applicable (auto-entrepreneur).
     """
+    # Étape 1 : créer la facture vide
+    log.info("Création facture brouillon pour customerId=%s…", customer_id)
+    invoice = abby_post(f"/v2/billing/invoice/{customer_id}", {})
+    if not invoice:
+        return None
+
+    billing_id = invoice.get("id")
+    log.info("Facture créée : id=%s — ajout de %d ligne(s)…", billing_id, len(items))
+
+    # Étape 2 : ajouter les lignes
     lines = []
     for item in items:
         unit_price_cents = round(item["unit_price_eur"] * 100)
         lines.append({
-            "designation": item["name"],
-            "quantity":    1,
-            "quantityUnit": "UNIT",
-            "unitPrice":   unit_price_cents,
-            "type":        "SERVICE_DELIVERY",
-            "vatCode":     "fr_not_applicable",  # TVA non applicable (auto-entrepreneur)
+            "designation":  item["name"],
+            "quantity":     1,
+            "quantityUnit": 14,   # 14 = UNIT dans l'enum Abby
+            "unitPrice":    unit_price_cents,
+            "type":         1,    # 1 = SERVICE (ProductType enum)
+            "vatCode":      "FR_00HT",  # TVA non applicable (auto-entrepreneur)
+            "isDeliveryOfGoods": False,
         })
 
-    body = {"lines": lines}
+    updated = abby_patch(f"/v2/billing/{billing_id}/lines", {"lines": lines})
+    if updated:
+        log.info("✅ Lignes ajoutées à la facture id=%s", billing_id)
+    else:
+        log.error("❌ Échec ajout des lignes (facture id=%s créée mais vide)", billing_id)
 
-    log.info("Création facture brouillon pour customerId=%s (%d ligne(s))…",
-             customer_id, len(lines))
-    return abby_post(f"/v2/billing/invoice/{customer_id}", body)
+    return updated or invoice
 
 
 # ─── TRAITEMENT COMMANDE ──────────────────────────────────────────────────────
@@ -241,10 +260,10 @@ def process_order(order_id: str):
         log.error("Impossible de trouver/créer le client — abandon.")
         return
 
-    # 2. Facture brouillon
-    invoice = create_invoice_draft(customer_id, items)
+    # 2. Facture brouillon avec lignes
+    invoice = create_invoice_with_lines(customer_id, items)
     if invoice:
-        log.info("✅ Facture brouillon créée : id=%s", invoice.get("id"))
+        log.info("✅ Facture brouillon finalisée : id=%s", invoice.get("id"))
     else:
         log.error("❌ Échec création facture.")
 
@@ -254,7 +273,6 @@ def process_order(order_id: str):
 def parse_webhook(payload: dict) -> tuple[str, dict, dict] | None:
     """
     Retourne (order_id, customer, item) depuis un webhook systeme.io.
-    item = { name, unit_price_eur }
     """
     try:
         data     = payload.get("data", {})
@@ -266,7 +284,6 @@ def parse_webhook(payload: dict) -> tuple[str, dict, dict] | None:
         amount_cents = offer.get("direct_charge_amount") or offer.get("amount", 0)
         unit_price   = round(amount_cents / 100, 2)
 
-        # Si la commande est à 0 € (100 % discount)
         total = data.get("order", {}).get("total_price")
         if total is not None and total == 0:
             unit_price = 0.0
@@ -283,7 +300,7 @@ def parse_webhook(payload: dict) -> tuple[str, dict, dict] | None:
 class WebhookHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):  # noqa: A002
-        pass  # logs gérés manuellement
+        pass
 
     def do_GET(self):
         self.send_response(200)
