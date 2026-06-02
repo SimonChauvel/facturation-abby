@@ -217,9 +217,9 @@ def create_invoice_with_lines(customer_id: str, items: list) -> dict | None:
         lines.append({
             "designation":  item["name"],
             "quantity":     1,
-            "quantityUnit": "unit",   # ← string comme avant
+            "quantityUnit": "unit",
             "unitPrice":    unit_price_cents,
-            "type":         2,        # ← nombre (pas "SERVICE_DELIVERY")
+            "type":         "service_delivery",   # ← string en minuscules
             "vatCode":      "FR_00HT",
             "isDeliveryOfGoods": False,
         })
