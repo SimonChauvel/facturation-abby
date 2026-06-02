@@ -16,6 +16,7 @@ ABBY_API_KEY  = os.environ.get("ABBY_API_KEY", "")
 ABBY_BASE_URL = "https://api.app-abby.com"
 DELAY_SECONDS = int(os.environ.get("DELAY_SECONDS", 60))
 PORT          = int(os.environ.get("PORT", 8080))
+INSEE_TOKEN   = os.environ.get("INSEE_TOKEN", "")   # ← ajouter ici
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -124,12 +125,16 @@ def create_organization(customer: dict) -> dict | None:
     email   = customer.get("email", "")
 
     vat_number = fields.get("tax_number", "")
-
+    siret = get_siret_from_vat(vat_number)
+    
     body = {
     "name": company,
     "emails": [email] if email else [],
     "vatNumber": vat_number,
-    }
+}
+if siret:
+    body["siret"] = siret
+}
     address_line = fields.get("address", "")
     city         = fields.get("city", "")
     zip_code     = fields.get("zip_code", fields.get("zipcode", ""))
