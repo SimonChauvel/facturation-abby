@@ -92,23 +92,22 @@ def get_siret_from_vat(vat_number: str) -> str | None:
 
     try:
         r = requests.get(
-            f"https://entreprise.data.gouv.fr/api/sirene/v3/unites_legales/{siren}",
-            timeout=10
-        )
-        if not r.ok:
-            log.error("data.gouv SIREN %s → %s %s", siren, r.status_code, r.text[:200])
-            return None
+    "https://recherche-entreprises.api.gouv.fr/search",
+    params={"q": siren, "page": 1, "per_page": 1},
+    timeout=10
+)
+if not r.ok:
+    log.error("recherche-entreprises SIREN %s → %s", siren, r.status_code)
+    return None
 
-        data = r.json()
-        siege = data.get("unite_legale", {}).get("etablissement_siege", {})
-        siret = siege.get("siret")
-        if siret:
-            log.info("SIRET récupéré via data.gouv : %s", siret)
-        return siret
+results = r.json().get("results", [])
+if not results:
+    return None
 
-    except Exception as e:
-        log.error("Erreur API data.gouv pour SIREN %s : %s", siren, e)
-        return None
+siret = results[0].get("siege", {}).get("siret")
+if siret:
+    log.info("SIRET récupéré : %s", siret)
+return siret
 
 # ─── LOGIQUE ABBY ─────────────────────────────────────────────────────────────
 
