@@ -219,7 +219,7 @@ def create_invoice_with_lines(customer_id: str, items: list) -> dict | None:
             "quantity":     1,
             "quantityUnit": "unit",
             "unitPrice":    unit_price_cents,
-            "type":         "service_delivery",   # ← string en minuscules
+            "type":         "sale_of_goods",   # ← string en minuscules
             "vatCode":      "FR_00HT",
             "isDeliveryOfGoods": False,
         })
