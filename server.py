@@ -16,8 +16,6 @@ ABBY_API_KEY  = os.environ.get("ABBY_API_KEY", "")
 ABBY_BASE_URL = "https://api.app-abby.com"
 DELAY_SECONDS = int(os.environ.get("DELAY_SECONDS", 60))
 PORT          = int(os.environ.get("PORT", 8080))
-INSEE_CONSUMER_KEY    = os.environ.get("INSEE_CONSUMER_KEY", "")
-INSEE_CONSUMER_SECRET = os.environ.get("INSEE_CONSUMER_SECRET", "")
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -82,36 +80,9 @@ def abby_patch(path: str, body: dict) -> dict | None:
 
 # ─── API INSEE (SIRET) ────────────────────────────────────────────────────────
 
-def get_insee_token() -> str | None:
-    """Obtient un token OAuth2 temporaire depuis l'API INSEE."""
-    consumer_key    = os.environ.get("INSEE_CONSUMER_KEY", "")
-    consumer_secret = os.environ.get("INSEE_CONSUMER_SECRET", "")
-
-    if not consumer_key or not consumer_secret:
-        log.warning("INSEE_CONSUMER_KEY ou INSEE_CONSUMER_SECRET non définis")
-        return None
-
-    try:
-        r = requests.post(
-            "https://api.insee.fr/token",
-            data={"grant_type": "client_credentials"},
-            auth=(consumer_key, consumer_secret),
-            timeout=10
-        )
-        if not r.ok:
-            log.error("INSEE token → %s %s", r.status_code, r.text[:200])
-            return None
-        return r.json().get("access_token")
-    except Exception as e:
-        log.error("Erreur obtention token INSEE : %s", e)
-        return None
-
-
 def get_siret_from_vat(vat_number: str) -> str | None:
-    """Déduit le SIREN depuis le numéro de TVA FR, puis récupère le SIRET via INSEE."""
     if not vat_number:
         return None
-
     vat_clean = vat_number.strip().upper()
     if not vat_clean.startswith("FR") or len(vat_clean) < 13:
         log.info("Numéro de TVA non FR ou trop court (%s) — SIRET ignoré", vat_number)
@@ -119,35 +90,24 @@ def get_siret_from_vat(vat_number: str) -> str | None:
 
     siren = vat_clean[4:]
 
-    token = get_insee_token()
-    if not token:
-        return None
-
     try:
         r = requests.get(
-            f"https://api.insee.fr/api-sirene/3.11/siren/{siren}",
-            headers={"Authorization": f"Bearer {token}"},
+            f"https://entreprise.data.gouv.fr/api/sirene/v3/unites_legales/{siren}",
             timeout=10
         )
         if not r.ok:
-            log.error("INSEE SIREN %s → %s %s", siren, r.status_code, r.text[:200])
+            log.error("data.gouv SIREN %s → %s %s", siren, r.status_code, r.text[:200])
             return None
 
-        data    = r.json()
-        periodes = data.get("uniteLegale", {}).get("periodesUniteLegale", [])
-        if not periodes:
-            return None
-
-        nic = periodes[0].get("nicSiegeUniteLegale", "")
-        if not nic:
-            return None
-
-        siret = siren + nic
-        log.info("SIRET récupéré via INSEE : %s", siret)
+        data = r.json()
+        siege = data.get("unite_legale", {}).get("etablissement_siege", {})
+        siret = siege.get("siret")
+        if siret:
+            log.info("SIRET récupéré via data.gouv : %s", siret)
         return siret
 
     except Exception as e:
-        log.error("Erreur API INSEE pour SIREN %s : %s", siren, e)
+        log.error("Erreur API data.gouv pour SIREN %s : %s", siren, e)
         return None
 
 # ─── LOGIQUE ABBY ─────────────────────────────────────────────────────────────
@@ -411,8 +371,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not ABBY_API_KEY:
         log.warning("⚠️  ABBY_API_KEY non définie !")
-    if not INSEE_CONSUMER_KEY or not INSEE_CONSUMER_SECRET:
-        log.warning("⚠️  INSEE_CONSUMER_KEY/SECRET non définis — le SIRET ne sera pas récupéré !")
 
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     log.info("Serveur démarré port %d (délai : %ds)", PORT, DELAY_SECONDS)
