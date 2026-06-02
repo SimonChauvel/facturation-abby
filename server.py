@@ -16,7 +16,7 @@ ABBY_API_KEY  = os.environ.get("ABBY_API_KEY", "")
 ABBY_BASE_URL = "https://api.app-abby.com"
 DELAY_SECONDS = int(os.environ.get("DELAY_SECONDS", 60))
 PORT          = int(os.environ.get("PORT", 8080))
-INSEE_TOKEN   = os.environ.get("INSEE_TOKEN", "")   # ← ajouter ici
+INSEE_TOKEN   = os.environ.get("INSEE_TOKEN", "")
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -79,13 +79,62 @@ def abby_patch(path: str, body: dict) -> dict | None:
     return None
 
 
+# ─── API INSEE (SIRET) ────────────────────────────────────────────────────────
+
+def get_siret_from_vat(vat_number: str) -> str | None:
+    """
+    Déduit le SIREN depuis le numéro de TVA FR (format FR + 2 chiffres + 9 chiffres),
+    puis interroge l'API Sirene (INSEE) pour récupérer le SIRET du siège social.
+    Retourne None si le numéro de TVA est absent, invalide, ou si l'API échoue.
+    """
+    if not vat_number:
+        return None
+
+    vat_clean = vat_number.strip().upper()
+    if not vat_clean.startswith("FR") or len(vat_clean) < 13:
+        log.info("Numéro de TVA non FR ou trop court (%s) — SIRET ignoré", vat_number)
+        return None
+
+    siren = vat_clean[4:]  # retire "FR" + 2 chiffres de clé TVA
+
+    if not INSEE_TOKEN:
+        log.warning("INSEE_TOKEN non défini — impossible de récupérer le SIRET")
+        return None
+
+    try:
+        r = requests.get(
+            f"https://api.insee.fr/api-sirene/3.11/siren/{siren}",
+            headers={"Authorization": f"Bearer {INSEE_TOKEN}"},
+            timeout=10
+        )
+        if not r.ok:
+            log.error("INSEE SIREN %s → %s %s", siren, r.status_code, r.text[:200])
+            return None
+
+        data = r.json()
+        periodes = data.get("uniteLegale", {}).get("periodesUniteLegale", [])
+        if not periodes:
+            log.warning("INSEE : aucune période trouvée pour SIREN %s", siren)
+            return None
+
+        nic = periodes[0].get("nicSiegeUniteLegale", "")
+        if not nic:
+            log.warning("INSEE : NIC siège absent pour SIREN %s", siren)
+            return None
+
+        siret = siren + nic
+        log.info("SIRET récupéré via INSEE : %s", siret)
+        return siret
+
+    except Exception as e:
+        log.error("Erreur API INSEE pour SIREN %s : %s", siren, e)
+        return None
+
+
 # ─── LOGIQUE ABBY ─────────────────────────────────────────────────────────────
 
 def find_contact_by_email(email: str) -> dict | None:
-    """Cherche un contact existant par e-mail.
-    Route correcte : GET /contacts (pluriel, sans /v2/)
-    Requiert page obligatoire.
-    """
+    """Cherche un contact existant par e-mail."""
     result = abby_get("/contacts", params={"search": email, "page": 1, "limit": 50})
     if not result:
         return None
@@ -101,10 +150,7 @@ def find_contact_by_email(email: str) -> dict | None:
 
 
 def find_organization_by_email(email: str) -> dict | None:
-    """Cherche une organisation existante par e-mail.
-    Route correcte : GET /organizations (pluriel, sans /v2/)
-    Requiert page obligatoire.
-    """
+    """Cherche une organisation existante par e-mail."""
     result = abby_get("/organizations", params={"search": email, "page": 1, "limit": 50})
     if not result:
         return None
@@ -120,21 +166,24 @@ def find_organization_by_email(email: str) -> dict | None:
 
 
 def create_organization(customer: dict) -> dict | None:
-    fields = customer.get("fields", {})
+    """Crée une nouvelle organisation dans Abby."""
+    fields  = customer.get("fields", {})
     company = fields.get("company_name") or f"{fields.get('first_name', '')} {fields.get('surname', '')}".strip()
     email   = customer.get("email", "")
 
-    vat_number = fields.get("tax_number", "")
+    vat_number = fields.get("tax_number", "") or ""
+
+    # Récupération du SIRET via l'API INSEE
     siret = get_siret_from_vat(vat_number)
-    
+
     body = {
-    "name": company,
-    "emails": [email] if email else [],
-    "vatNumber": vat_number,
-}
-if siret:
-    body["siret"] = siret
-}
+        "name":      company,
+        "emails":    [email] if email else [],
+        "vatNumber": vat_number,
+    }
+    if siret:
+        body["siret"] = siret
+
     address_line = fields.get("address", "")
     city         = fields.get("city", "")
     zip_code     = fields.get("zip_code", fields.get("zipcode", ""))
@@ -142,14 +191,14 @@ if siret:
 
     if address_line and city and zip_code:
         body["billingAddress"] = {
-            "address":  address_line,
-            "city":     city,
-            "zipCode":  zip_code,
-            "country":  country.upper()[:2],
+            "address": address_line,
+            "city":    city,
+            "zipCode": zip_code,
+            "country": country.upper()[:2],
         }
 
-    log.info("Création organisation : %s", company)
-    return abby_post("/organization", body)  # ← singulier, sans /v2/
+    log.info("Création organisation : %s (SIRET: %s)", company, siret or "non disponible")
+    return abby_post("/organization", body)
 
 
 def get_or_create_customer_id(customer: dict) -> str | None:
@@ -158,20 +207,20 @@ def get_or_create_customer_id(customer: dict) -> str | None:
     """
     email = customer.get("email", "")
 
-    # 1. Cherche une organisation
+    # 1. Cherche une organisation existante
     org = find_organization_by_email(email)
     if org:
         log.info("Organisation trouvée : %s (id=%s)", org.get("name"), org.get("id"))
         return org["id"]
 
-    # 2. Cherche un contact simple
+    # 2. Cherche un contact simple existant
     contact = find_contact_by_email(email)
     if contact:
         log.info("Contact trouvé : %s (id=%s)", contact.get("fullname", ""), contact.get("id"))
         return contact["id"]
 
     # 3. Crée l'organisation ou le contact
-    fields = customer.get("fields", {})
+    fields  = customer.get("fields", {})
     company = fields.get("company_name", "")
     if company:
         new_org = create_organization(customer)
@@ -179,14 +228,13 @@ def get_or_create_customer_id(customer: dict) -> str | None:
             log.info("Organisation créée : id=%s", new_org.get("id"))
             return new_org["id"]
     else:
-        first  = fields.get("first_name", "")
-        last   = fields.get("surname", fields.get("last_name", ""))
-        body   = {
+        first = fields.get("first_name", "")
+        last  = fields.get("surname", fields.get("last_name", ""))
+        body  = {
             "firstname": first or "Client",
             "lastname":  last or first or "Client",
             "emails":    [email] if email else [],
         }
-        # Route correcte : POST /contact (singulier, sans /v2/)
         new_contact = abby_post("/contact", body)
         if new_contact:
             log.info("Contact créé : id=%s", new_contact.get("id"))
@@ -198,13 +246,7 @@ def get_or_create_customer_id(customer: dict) -> str | None:
 def create_invoice_with_lines(customer_id: str, items: list) -> dict | None:
     """
     Crée une facture brouillon puis y ajoute toutes les lignes via PATCH.
-
-    Étape 1 : POST /v2/billing/invoice/{customerId}  → crée la facture vide
-    Étape 2 : PATCH /v2/billing/{billingId}/lines    → ajoute les lignes
-
-    Montants en centimes. vatCode FR_00HT = TVA non applicable (auto-entrepreneur).
     """
-    # Étape 1 : créer la facture vide
     log.info("Création facture brouillon pour customerId=%s…", customer_id)
     invoice = abby_post(f"/v2/billing/invoice/{customer_id}", {})
     if not invoice:
@@ -213,19 +255,19 @@ def create_invoice_with_lines(customer_id: str, items: list) -> dict | None:
     billing_id = invoice.get("id")
     log.info("Facture créée : id=%s — ajout de %d ligne(s)…", billing_id, len(items))
 
-    # Étape 2 : ajouter les lignes
     lines = []
     for item in items:
         unit_price_cents = round(item["unit_price_eur"] * 100)
         lines.append({
-            "designation":  item["name"],
-            "quantity":     1,
-            "quantityUnit": "unit",
-            "unitPrice":    unit_price_cents,
-            "type":         "sale_of_goods",   # ← string en minuscules
-            "vatCode":      "FR_00HT",
+            "designation":      item["name"],
+            "quantity":         1,
+            "quantityUnit":     "unit",
+            "unitPrice":        unit_price_cents,
+            "type":             "sale_of_goods",
+            "vatCode":          "FR_00HT",
             "isDeliveryOfGoods": False,
         })
+
     updated = abby_patch(f"/v2/billing/{billing_id}/lines", {"lines": lines})
     if updated:
         log.info("✅ Lignes ajoutées à la facture id=%s", billing_id)
@@ -256,13 +298,11 @@ def process_order(order_id: str):
     for it in items:
         log.info("  • %s (%.2f €)", it["name"], it["unit_price_eur"])
 
-    # 1. Client Abby
     customer_id = get_or_create_customer_id(customer)
     if not customer_id:
         log.error("Impossible de trouver/créer le client — abandon.")
         return
 
-    # 2. Facture brouillon avec lignes
     invoice = create_invoice_with_lines(customer_id, items)
     if invoice:
         log.info("✅ Facture brouillon finalisée : id=%s", invoice.get("id"))
@@ -352,6 +392,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not ABBY_API_KEY:
         log.warning("⚠️  ABBY_API_KEY non définie !")
+    if not INSEE_TOKEN:
+        log.warning("⚠️  INSEE_TOKEN non défini — le SIRET ne sera pas récupéré !")
 
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     log.info("Serveur démarré port %d (délai : %ds)", PORT, DELAY_SECONDS)
