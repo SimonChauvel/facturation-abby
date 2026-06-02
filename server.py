@@ -217,13 +217,12 @@ def create_invoice_with_lines(customer_id: str, items: list) -> dict | None:
         lines.append({
             "designation":  item["name"],
             "quantity":     1,
-            "quantityUnit": 14,
+            "quantityUnit": "unit",   # ← string comme avant
             "unitPrice":    unit_price_cents,
-            "type":         2,
+            "type":         2,        # ← nombre (pas "SERVICE_DELIVERY")
             "vatCode":      "FR_00HT",
             "isDeliveryOfGoods": False,
         })
-
     updated = abby_patch(f"/v2/billing/{billing_id}/lines", {"lines": lines})
     if updated:
         log.info("✅ Lignes ajoutées à la facture id=%s", billing_id)
