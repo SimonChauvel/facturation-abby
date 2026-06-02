@@ -217,10 +217,10 @@ def create_invoice_with_lines(customer_id: str, items: list) -> dict | None:
         lines.append({
             "designation":  item["name"],
             "quantity":     1,
-            "quantityUnit": 14,   # 14 = UNIT dans l'enum Abby
+            "quantityUnit": 14,
             "unitPrice":    unit_price_cents,
-            "type":         1,    # 1 = SERVICE (ProductType enum)
-            "vatCode":      "FR_00HT",  # TVA non applicable (auto-entrepreneur)
+            "type":         2,
+            "vatCode":      "FR_00HT",
             "isDeliveryOfGoods": False,
         })
 
