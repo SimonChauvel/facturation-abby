@@ -126,12 +126,18 @@ def create_organization(customer: dict) -> dict | None:
     company = fields.get("company_name") or f"{fields.get('first_name', '')} {fields.get('surname', '')}".strip()
     email   = customer.get("email", "")
 
-    body = {
-        "name": company,
-        "emails": [email] if email else [],
-        "vatNumber": fields.get("tax_number", "") or "",
-    }
+    vat_number = fields.get("tax_number", "") or ""
 
+siren = ""
+if vat_number.upper().startswith("FR") and len(vat_number) >= 13:
+    siren = vat_number[4:]  # enlève "FR" + les 2 chiffres de clé
+
+body = {
+    "name": company,
+    "emails": [email] if email else [],
+    "vatNumber": vat_number,
+    "siren": siren,
+}
     address_line = fields.get("address", "")
     city         = fields.get("city", "")
     zip_code     = fields.get("zip_code", fields.get("zipcode", ""))
