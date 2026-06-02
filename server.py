@@ -16,7 +16,8 @@ ABBY_API_KEY  = os.environ.get("ABBY_API_KEY", "")
 ABBY_BASE_URL = "https://api.app-abby.com"
 DELAY_SECONDS = int(os.environ.get("DELAY_SECONDS", 60))
 PORT          = int(os.environ.get("PORT", 8080))
-INSEE_TOKEN   = os.environ.get("INSEE_TOKEN", "")
+INSEE_CONSUMER_KEY    = os.environ.get("INSEE_CONSUMER_KEY", "")
+INSEE_CONSUMER_SECRET = os.environ.get("INSEE_CONSUMER_SECRET", "")
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -81,12 +82,33 @@ def abby_patch(path: str, body: dict) -> dict | None:
 
 # ─── API INSEE (SIRET) ────────────────────────────────────────────────────────
 
+def get_insee_token() -> str | None:
+    """Obtient un token OAuth2 temporaire depuis l'API INSEE."""
+    consumer_key    = os.environ.get("INSEE_CONSUMER_KEY", "")
+    consumer_secret = os.environ.get("INSEE_CONSUMER_SECRET", "")
+
+    if not consumer_key or not consumer_secret:
+        log.warning("INSEE_CONSUMER_KEY ou INSEE_CONSUMER_SECRET non définis")
+        return None
+
+    try:
+        r = requests.post(
+            "https://api.insee.fr/token",
+            data={"grant_type": "client_credentials"},
+            auth=(consumer_key, consumer_secret),
+            timeout=10
+        )
+        if not r.ok:
+            log.error("INSEE token → %s %s", r.status_code, r.text[:200])
+            return None
+        return r.json().get("access_token")
+    except Exception as e:
+        log.error("Erreur obtention token INSEE : %s", e)
+        return None
+
+
 def get_siret_from_vat(vat_number: str) -> str | None:
-    """
-    Déduit le SIREN depuis le numéro de TVA FR (format FR + 2 chiffres + 9 chiffres),
-    puis interroge l'API Sirene (INSEE) pour récupérer le SIRET du siège social.
-    Retourne None si le numéro de TVA est absent, invalide, ou si l'API échoue.
-    """
+    """Déduit le SIREN depuis le numéro de TVA FR, puis récupère le SIRET via INSEE."""
     if not vat_number:
         return None
 
@@ -95,31 +117,29 @@ def get_siret_from_vat(vat_number: str) -> str | None:
         log.info("Numéro de TVA non FR ou trop court (%s) — SIRET ignoré", vat_number)
         return None
 
-    siren = vat_clean[4:]  # retire "FR" + 2 chiffres de clé TVA
+    siren = vat_clean[4:]
 
-    if not INSEE_TOKEN:
-        log.warning("INSEE_TOKEN non défini — impossible de récupérer le SIRET")
+    token = get_insee_token()
+    if not token:
         return None
 
     try:
         r = requests.get(
             f"https://api.insee.fr/api-sirene/3.11/siren/{siren}",
-            headers={"Authorization": f"Bearer {INSEE_TOKEN}"},
+            headers={"Authorization": f"Bearer {token}"},
             timeout=10
         )
         if not r.ok:
             log.error("INSEE SIREN %s → %s %s", siren, r.status_code, r.text[:200])
             return None
 
-        data = r.json()
+        data    = r.json()
         periodes = data.get("uniteLegale", {}).get("periodesUniteLegale", [])
         if not periodes:
-            log.warning("INSEE : aucune période trouvée pour SIREN %s", siren)
             return None
 
         nic = periodes[0].get("nicSiegeUniteLegale", "")
         if not nic:
-            log.warning("INSEE : NIC siège absent pour SIREN %s", siren)
             return None
 
         siret = siren + nic
@@ -129,7 +149,6 @@ def get_siret_from_vat(vat_number: str) -> str | None:
     except Exception as e:
         log.error("Erreur API INSEE pour SIREN %s : %s", siren, e)
         return None
-
 
 # ─── LOGIQUE ABBY ─────────────────────────────────────────────────────────────
 
@@ -392,8 +411,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not ABBY_API_KEY:
         log.warning("⚠️  ABBY_API_KEY non définie !")
-    if not INSEE_TOKEN:
-        log.warning("⚠️  INSEE_TOKEN non défini — le SIRET ne sera pas récupéré !")
+    if not INSEE_CONSUMER_KEY or not INSEE_CONSUMER_SECRET:
+        log.warning("⚠️  INSEE_CONSUMER_KEY/SECRET non définis — le SIRET ne sera pas récupéré !")
 
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     log.info("Serveur démarré port %d (délai : %ds)", PORT, DELAY_SECONDS)
